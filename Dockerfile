@@ -5,14 +5,6 @@ FROM python:3.12.3-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies (for chromadb, sentence-transformers, etc.)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        curl \
-        && rm -rf /var/lib/apt/lists/*
-
 # Set work directory
 WORKDIR /app
 
@@ -20,8 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .
