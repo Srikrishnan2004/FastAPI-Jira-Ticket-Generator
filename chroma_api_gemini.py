@@ -256,8 +256,8 @@ def generate_ticket(request: GenerateTicketRequest):
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         payload = {"fields": {
             "project": {"key": settings.project_key},
-            "summary": ticket_details["summary"],
-            "description": ticket_details["description"],
+            "summary": ticket_details["description"],
+            "description": "",
             "issuetype": {"name": ticket_details["issue_type"]}
         }}
 
