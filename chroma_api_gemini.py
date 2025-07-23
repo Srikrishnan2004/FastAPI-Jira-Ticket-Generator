@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from requests.auth import HTTPBasicAuth
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, List
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
@@ -35,8 +35,6 @@ class Settings(BaseSettings):
     jira_api_token: str
     jira_base_url: str = "https://ssn-team-j7z071w8.atlassian.net"
     project_key: str = "ECSA"
-    # This is the custom field ID for "Epic Link" in many Jira setups.
-    # You may need to verify this in your Jira instance's custom field settings.
     epic_link_field_id: str = "customfield_10014"
 
     class Config:
@@ -50,16 +48,15 @@ auth = HTTPBasicAuth(settings.jira_email, settings.jira_api_token)
 # --- App Startup Event ---
 @app.on_event("startup")
 async def startup_event():
-    # Initialize Vertex AI for Gemini access
     if not GCP_PROJECT_ID:
         logging.error("GCP_PROJECT_ID environment variable not set. Vertex AI initialization failed.")
         return
-
     try:
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
         logging.info(f"Vertex AI initialized for project {GCP_PROJECT_ID} in region {GCP_LOCATION}")
     except Exception as e:
         logging.error(f"Failed to initialize Vertex AI: {e}. Ensure your environment is authenticated.")
+
 
 # --- Pydantic Models ---
 class AddDocumentRequest(BaseModel):
@@ -67,22 +64,21 @@ class AddDocumentRequest(BaseModel):
     metadata: dict
     id: str
 
+
 class GenerateTicketRequest(BaseModel):
     commit_message: str
     repo: str
     assignee_email: Optional[str] = None
+
 
 class GenerateClientTicketRequest(BaseModel):
     request_text: str
     repo: str
     assignee_email: Optional[str] = None
 
+
 # --- Jira Helper Function ---
 def get_account_id_by_email(email: str) -> Optional[str]:
-    """
-    Finds a Jira user's accountId by their email address.
-    Returns the accountId string or None if not found.
-    """
     url = f"{settings.jira_base_url}/rest/api/3/user/search"
     headers = {"Accept": "application/json"}
     params = {"query": email}
@@ -98,6 +94,7 @@ def get_account_id_by_email(email: str) -> Optional[str]:
         logging.error(f"Failed to search for Jira user by email '{email}': {e}")
         return None
 
+
 # --- API Endpoints ---
 @app.post("/add")
 def add_document(request: AddDocumentRequest):
@@ -111,19 +108,13 @@ def add_document(request: AddDocumentRequest):
 
 @app.get("/getall")
 def get_all_documents():
-    """
-    Retrieves all documents, metadata, and IDs from the ChromaDB collection.
-    """
     try:
         count = collection.count()
         if count == 0:
             return {"message": "The collection is empty."}
-
-        # Retrieve all items by using the total count as the limit
         all_items = collection.get(limit=count)
         return all_items
     except Exception as e:
-        logging.error(f"Failed to retrieve all documents from ChromaDB: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred while fetching from ChromaDB: {e}")
 
 
@@ -132,16 +123,16 @@ def generate_ticket(request: GenerateTicketRequest):
     logging.info("Attempting to generate ticket for: %s", request.commit_message)
 
     gatekeeper_system_instruction = """
-       You are an expert JIRA Ticket Automation Agent. Your **SOLE PURPOSE** is to classify a given commit message as either "Substantive" or "Non-Substantive".
-       **CRITICAL RULE: You MUST respond ONLY with a single JSON object. No other text or explanation.**
-       **Classification Rules:**
-       **A. Non-Substantive Commits:**
-       These are routine maintenance, documentation, or trivial changes. If a commit clearly falls into *any* of these categories, you **MUST respond ONLY** with the following exact JSON object:
-       `{"status": "No Jira ticket generated. The commit message was identified as a non-substantive update."}`
-       **B. Substantive Commits:**
-       These are changes that directly impact the application's functionality. If a commit falls into any of these categories, you **MUST respond ONLY** with the following exact JSON object:
-       `{"status": "Jira ticket required. The commit message indicates a substantive change."}`
-       """
+           You are an expert JIRA Ticket Automation Agent. Your **SOLE PURPOSE** is to classify a given commit message as either "Substantive" or "Non-Substantive".
+           **CRITICAL RULE: You MUST respond ONLY with a single JSON object. No other text or explanation.**
+           **Classification Rules:**
+           **A. Non-Substantive Commits:**
+           These are routine maintenance, documentation, or trivial changes. If a commit clearly falls into *any* of these categories, you **MUST respond ONLY** with the following exact JSON object:
+           `{"status": "No Jira ticket generated. The commit message was identified as a non-substantive update."}`
+           **B. Substantive Commits:**
+           These are changes that directly impact the application's functionality. If a commit falls into any of these categories, you **MUST respond ONLY** with the following exact JSON object:
+           `{"status": "Jira ticket required. The commit message indicates a substantive change."}`
+           """
     try:
         gatekeeper_model = GenerativeModel("gemini-2.5-pro", system_instruction=[gatekeeper_system_instruction])
         gatekeeper_response = gatekeeper_model.generate_content(
@@ -159,9 +150,8 @@ def generate_ticket(request: GenerateTicketRequest):
 
     logging.info("Commit identified as substantive. Proceeding to generate Jira ticket.")
 
-    # --- ChromaDB Search Logic ---
     search_priority = ["Epic", "Story", "Task", "Sub-task", "Bug"]
-    matched_metadata, matched_document, parent_chain = None, None, []
+    parent_chain = []
 
     def find_best_descendant(parent_key, child_issue_type):
         results = collection.query(
@@ -196,7 +186,7 @@ def generate_ticket(request: GenerateTicketRequest):
                     break
             break
 
-    unique_chain = []
+    unique_chain = [];
     if parent_chain:
         seen_keys = set();
         [unique_chain.insert(0, p) for p in reversed(parent_chain) if
@@ -269,21 +259,34 @@ def generate_ticket(request: GenerateTicketRequest):
         if ticket_details["issue_type"] not in ["Task", "Bug", "Sub-task"]:
             raise ValueError(f"Invalid issue_type generated: '{ticket_details['issue_type']}'.")
 
-        # --- Create Jira Issue ---
         url = f"{settings.jira_base_url}/rest/api/3/issue"
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+        # --- CORRECTED: Atlassian Document Format for description ---
+        adf_description = {
+            "type": "doc", "version": 1, "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": ticket_details.get("description", "")}
+                ]}
+            ]
+        }
+
         payload = {"fields": {
             "project": {"key": settings.project_key},
-            "summary": ticket_details["description"],
-            "description": "",
+            "summary": ticket_details["summary"],
+            "description": adf_description,
             "issuetype": {"name": ticket_details["issue_type"]}
         }}
 
-        if ticket_details["issue_type"] == "Sub-task" and ticket_details["parent"] != "N/A":
-            payload["fields"]["parent"] = {"key": ticket_details["parent"]}
-        elif ticket_details["parent"] != "N/A":
-            # Assume parent is an Epic for Tasks and Bugs
-            payload["fields"][settings.epic_link_field_id] = ticket_details["parent"]
+        # --- CORRECTED: Smarter Parent and Epic Linking Logic ---
+        parent_key_from_llm = ticket_details.get("parent")
+        if ticket_details["issue_type"] == "Sub-task" and parent_key_from_llm != "N/A":
+            payload["fields"]["parent"] = {"key": parent_key_from_llm}
+        else:
+            # For Tasks and Bugs, find the actual Epic in the hierarchy
+            epic_key = next((item['key'] for item in unique_chain if item['issue_type'] == 'Epic'), None)
+            if epic_key:
+                payload["fields"][settings.epic_link_field_id] = epic_key
 
         if request.assignee_email:
             account_id = get_account_id_by_email(request.assignee_email)
@@ -293,7 +296,7 @@ def generate_ticket(request: GenerateTicketRequest):
                 logging.warning(f"Could not find Jira user for assignee email: {request.assignee_email}.")
 
         jira_response = requests.post(url, headers=headers, auth=auth, json=payload)
-        jira_response.raise_for_status()  # Raise an exception for bad status codes
+        jira_response.raise_for_status()
 
         return {"message": "Jira ticket created successfully", "key": jira_response.json()["key"],
                 "generated_details": ticket_details}
@@ -336,7 +339,7 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
     epic_search_results = collection.query(
         query_texts=[request.request_text], n_results=1,
         where={"$and": [{"repo": request.repo}, {"issue_type": "Epic"}]},
-        include=["metadatas","documents", "distances"]
+        include=["metadatas", "ids"]
     )
     related_epic_view, parent_epic_key = "No related Epic found.", "N/A"
     if epic_search_results and epic_search_results.get("ids") and epic_search_results["ids"][0]:
@@ -389,13 +392,21 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
         if ticket_details["issue_type"] not in ["Epic", "Story"]:
             raise ValueError(f"Invalid issue_type generated: '{ticket_details['issue_type']}'.")
 
-        # --- Create Jira Issue ---
+        # --- CORRECTED: Atlassian Document Format for description ---
+        adf_description = {
+            "type": "doc", "version": 1, "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": ticket_details.get("description", "")}
+                ]}
+            ]
+        }
+
         url = f"{settings.jira_base_url}/rest/api/3/issue"
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         payload = {"fields": {
             "project": {"key": settings.project_key},
             "summary": ticket_details["summary"],
-            "description": ticket_details["description"],
+            "description": adf_description,
             "issuetype": {"name": ticket_details["issue_type"]}
         }}
 
