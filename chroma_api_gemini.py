@@ -2,13 +2,18 @@ import logging
 import json
 import os
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from pydantic import BaseModel
 from requests.auth import HTTPBasicAuth
 from pydantic_settings import BaseSettings
 from typing import Optional, List
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+# --- SQLAlchemy Database Imports ---
+from sqlalchemy import create_engine, Column, Integer, String, Text, Enum, TIMESTAMP, ForeignKey, JSON
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy.sql import func
 
 # --- Import Google Cloud Vertex AI SDK components ---
 import vertexai
@@ -29,13 +34,20 @@ GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "cobalt-howl-465609-b8")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 
 
-# --- Jira Configuration ---
+# --- Main Configuration using BaseSettings ---
 class Settings(BaseSettings):
+    # Jira
     jira_email: str
     jira_api_token: str
     jira_base_url: str = "https://ssn-team-j7z071w8.atlassian.net"
     project_key: str = "ECSA"
     epic_link_field_id: str = "customfield_10014"
+
+    # Database
+    db_user: str
+    db_password: str
+    db_host: str
+    db_name: str
 
     class Config:
         env_file = ".env"
@@ -43,6 +55,64 @@ class Settings(BaseSettings):
 
 settings = Settings()
 auth = HTTPBasicAuth(settings.jira_email, settings.jira_api_token)
+
+# --- Database Setup ---
+DATABASE_URL = f"mysql+pymysql://{settings.db_user}:{settings.db_password}@{settings.db_host}/{settings.db_name}"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# --- SQLAlchemy ORM Models ---
+class GenerationRequestDB(Base):
+    __tablename__ = "generation_requests"
+    request_id = Column(Integer, primary_key=True, autoincrement=True)
+    request_type = Column(Enum('developer', 'client'), nullable=False)
+    raw_input = Column(Text, nullable=False)
+    repository = Column(String(255))
+    assignee_email = Column(String(255))
+    request_timestamp = Column(TIMESTAMP, server_default=func.now())
+
+
+class ClassificationLogDB(Base):
+    __tablename__ = "classification_logs"
+    log_id = Column(Integer, primary_key=True, autoincrement=True)
+    request_id = Column(Integer, ForeignKey("generation_requests.request_id"))
+    model_name = Column(String(100), nullable=False)
+    decision = Column(Enum('approved', 'rejected'), nullable=False)
+    rejection_reason = Column(String(255))
+    raw_response_json = Column(JSON)
+    processed_timestamp = Column(TIMESTAMP, server_default=func.now())
+
+
+class GeneratedTicketDB(Base):
+    __tablename__ = "generated_tickets"
+    ticket_log_id = Column(Integer, primary_key=True, autoincrement=True)
+    request_id = Column(Integer, ForeignKey("generation_requests.request_id"))
+    classification_log_id = Column(Integer, ForeignKey("classification_logs.log_id"))
+    jira_issue_key = Column(String(50), nullable=False, unique=True)
+    jira_issue_id = Column(String(50), nullable=False)
+    summary = Column(Text, nullable=False)
+    issue_type = Column(String(50), nullable=False)
+    parent_issue_key = Column(String(50))
+    assignee_account_id = Column(String(100))
+    generated_by_model = Column(String(100), nullable=False)
+    raw_generated_json = Column(JSON)
+    creation_timestamp = Column(TIMESTAMP, server_default=func.now())
+
+
+# Create tables if they don't exist
+Base.metadata.create_all(bind=engine)
+
+
+# Dependency to get a DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # --- App Startup Event ---
@@ -97,7 +167,7 @@ def get_account_id_by_email(email: str) -> Optional[str]:
 
 # --- API Endpoints ---
 @app.post("/add")
-def add_document(request: AddDocumentRequest):
+def add_document(request: AddDocumentRequest, db: Session = Depends(get_db)):
     collection.add(
         documents=[request.document],
         metadatas=[request.metadata],
@@ -107,7 +177,7 @@ def add_document(request: AddDocumentRequest):
 
 
 @app.get("/getall")
-def get_all_documents():
+def get_all_documents(db: Session = Depends(get_db)):
     try:
         count = collection.count()
         if count == 0:
@@ -119,8 +189,16 @@ def get_all_documents():
 
 
 @app.post("/generate_ticket")
-def generate_ticket(request: GenerateTicketRequest):
-    logging.info("Attempting to generate ticket for: %s", request.commit_message)
+def generate_ticket(request: GenerateTicketRequest, db: Session = Depends(get_db)):
+    db_request = GenerationRequestDB(
+        request_type='developer',
+        raw_input=request.commit_message,
+        repository=request.repo,
+        assignee_email=request.assignee_email
+    )
+    db.add(db_request)
+    db.commit()
+    db.refresh(db_request)
 
     gatekeeper_system_instruction = """
            You are an expert JIRA Ticket Automation Agent. Your **SOLE PURPOSE** is to classify a given commit message as either "Substantive" or "Non-Substantive".
@@ -141,7 +219,20 @@ def generate_ticket(request: GenerateTicketRequest):
             safety_settings={category: HarmBlockThreshold.BLOCK_NONE for category in HarmCategory}
         )
         gatekeeper_parsed_json = json.loads(gatekeeper_response.text)
-        if "No Jira ticket generated" in gatekeeper_parsed_json.get("status", ""):
+
+        is_rejected = "No Jira ticket generated" in gatekeeper_parsed_json.get("status", "")
+        db_classification = ClassificationLogDB(
+            request_id=db_request.request_id,
+            model_name="gemini-2.5-pro",
+            decision='rejected' if is_rejected else 'approved',
+            rejection_reason=gatekeeper_parsed_json.get("status") if is_rejected else None,
+            raw_response_json=gatekeeper_parsed_json
+        )
+        db.add(db_classification)
+        db.commit()
+        db.refresh(db_classification)
+
+        if is_rejected:
             return gatekeeper_parsed_json
         if "Jira ticket required" not in gatekeeper_parsed_json.get("status", ""):
             raise HTTPException(status_code=500, detail="Gatekeeper LLM returned an unexpected status.")
@@ -151,13 +242,13 @@ def generate_ticket(request: GenerateTicketRequest):
     logging.info("Commit identified as substantive. Proceeding to generate Jira ticket.")
 
     search_priority = ["Epic", "Story", "Task", "Sub-task", "Bug"]
-    parent_chain = []
+    matched_metadata, matched_document, parent_chain = None, None, []
 
     def find_best_descendant(parent_key, child_issue_type):
         results = collection.query(
             query_texts=[request.commit_message], n_results=1,
             where={"$and": [{"repo": request.repo}, {"issue_type": child_issue_type}, {"parent": parent_key}]},
-            include=["metadatas", "documents", "distances"]
+            include=["metadatas", "documents", "ids"]
         )
         if results and results.get("ids") and results["ids"][0]:
             child_metadata = dict(results["metadatas"][0][0]);
@@ -169,7 +260,7 @@ def generate_ticket(request: GenerateTicketRequest):
         results = collection.query(
             query_texts=[request.commit_message], n_results=1,
             where={"$and": [{"repo": request.repo}, {"issue_type": issue_type}]},
-            include=["metadatas", "documents", "distances"]
+            include=["metadatas", "documents", "ids"]
         )
         if results and results.get("ids") and results["ids"][0]:
             matched_metadata = dict(results["metadatas"][0][0]);
@@ -244,7 +335,6 @@ def generate_ticket(request: GenerateTicketRequest):
     ticket_generation_user_prompt = f"Commit Message: {request.commit_message}\nRepository: {request.repo}\n\n{hierarchy_view}\n\nGenerate the JIRA ticket."
 
     try:
-        logging.info("Calling Ticket Generation LLM (Gemini).")
         ticket_model = GenerativeModel("gemini-2.5-pro", system_instruction=[ticket_generation_system_instruction])
         response = ticket_model.generate_content(
             [ticket_generation_user_prompt],
@@ -259,18 +349,8 @@ def generate_ticket(request: GenerateTicketRequest):
         if ticket_details["issue_type"] not in ["Task", "Bug", "Sub-task"]:
             raise ValueError(f"Invalid issue_type generated: '{ticket_details['issue_type']}'.")
 
-        url = f"{settings.jira_base_url}/rest/api/3/issue"
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-
-        # --- CORRECTED: Atlassian Document Format for description ---
-        adf_description = {
-            "type": "doc", "version": 1, "content": [
-                {"type": "paragraph", "content": [
-                    {"type": "text", "text": ticket_details.get("description", "")}
-                ]}
-            ]
-        }
-
+        adf_description = {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": ticket_details.get("description", "")}]}]}
         payload = {"fields": {
             "project": {"key": settings.project_key},
             "summary": ticket_details["summary"],
@@ -278,39 +358,59 @@ def generate_ticket(request: GenerateTicketRequest):
             "issuetype": {"name": ticket_details["issue_type"]}
         }}
 
-        # --- CORRECTED: Smarter Parent and Epic Linking Logic ---
         parent_key_from_llm = ticket_details.get("parent")
         if ticket_details["issue_type"] == "Sub-task" and parent_key_from_llm != "N/A":
             payload["fields"]["parent"] = {"key": parent_key_from_llm}
         else:
-            # For Tasks and Bugs, find the actual Epic in the hierarchy
             epic_key = next((item['key'] for item in unique_chain if item['issue_type'] == 'Epic'), None)
             if epic_key:
                 payload["fields"][settings.epic_link_field_id] = epic_key
 
+        assignee_account_id = None
         if request.assignee_email:
-            account_id = get_account_id_by_email(request.assignee_email)
-            if account_id:
-                payload["fields"]["assignee"] = {"accountId": account_id}
-            else:
-                logging.warning(f"Could not find Jira user for assignee email: {request.assignee_email}.")
+            assignee_account_id = get_account_id_by_email(request.assignee_email)
+            if assignee_account_id:
+                payload["fields"]["assignee"] = {"accountId": assignee_account_id}
 
-        jira_response = requests.post(url, headers=headers, auth=auth, json=payload)
+        jira_response = requests.post(f"{settings.jira_base_url}/rest/api/3/issue",
+                                      headers={"Accept": "application/json", "Content-Type": "application/json"},
+                                      auth=auth, json=payload)
         jira_response.raise_for_status()
+        jira_issue_data = jira_response.json()
 
-        return {"message": "Jira ticket created successfully", "key": jira_response.json()["key"],
+        db_ticket = GeneratedTicketDB(
+            request_id=db_request.request_id,
+            classification_log_id=db_classification.log_id,
+            jira_issue_key=jira_issue_data["key"],
+            jira_issue_id=jira_issue_data["id"],
+            summary=ticket_details["summary"],
+            issue_type=ticket_details["issue_type"],
+            parent_issue_key=ticket_details.get("parent"),
+            assignee_account_id=assignee_account_id,
+            generated_by_model="gemini-2.5-pro",
+            raw_generated_json=ticket_details
+        )
+        db.add(db_ticket)
+        db.commit()
+
+        return {"message": "Jira ticket created successfully", "key": jira_issue_data["key"],
                 "generated_details": ticket_details}
 
-    except requests.exceptions.HTTPError as e:
-        raise HTTPException(status_code=e.response.status_code,
-                            detail=f"Failed to create Jira issue: {e.response.text}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.post("/generate_client_ticket")
-def generate_client_ticket(request: GenerateClientTicketRequest):
-    logging.info("Attempting to generate client ticket for: %s", request.request_text)
+def generate_client_ticket(request: GenerateClientTicketRequest, db: Session = Depends(get_db)):
+    db_request = GenerationRequestDB(
+        request_type='client',
+        raw_input=request.request_text,
+        repository=request.repo,
+        assignee_email=request.assignee_email
+    )
+    db.add(db_request)
+    db.commit()
+    db.refresh(db_request)
 
     gatekeeper_system_instruction = """
         You are a requirements analyst AI. Classify a client's request into one of three categories: "Client Feature Request", "Developer Task", or "Vague Request".
@@ -328,7 +428,20 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
             safety_settings={category: HarmBlockThreshold.BLOCK_NONE for category in HarmCategory}
         )
         gatekeeper_parsed_json = json.loads(gatekeeper_response.text.strip())
-        if "Ticket not generated" in gatekeeper_parsed_json.get("status", ""):
+
+        is_rejected = "Ticket not generated" in gatekeeper_parsed_json.get("status", "")
+        db_classification = ClassificationLogDB(
+            request_id=db_request.request_id,
+            model_name="gemini-2.5-pro",
+            decision='rejected' if is_rejected else 'approved',
+            rejection_reason=gatekeeper_parsed_json.get("status") if is_rejected else None,
+            raw_response_json=gatekeeper_parsed_json
+        )
+        db.add(db_classification)
+        db.commit()
+        db.refresh(db_classification)
+
+        if is_rejected:
             return gatekeeper_parsed_json
         if "Actionable request received" not in gatekeeper_parsed_json.get("status", ""):
             raise HTTPException(status_code=500, detail="Gatekeeper LLM returned an unexpected status.")
@@ -377,7 +490,6 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
     """
     ticket_generation_user_prompt = f"Client's Request: \"{request.request_text}\"\n\nContext:\n{related_epic_view}\n\nGenerate the JIRA ticket as a JSON object."
     try:
-        logging.info("Calling Ticket Generation LLM (Gemini) for client ticket.")
         ticket_model = GenerativeModel("gemini-2.5-pro", system_instruction=[ticket_generation_system_instruction])
         response = ticket_model.generate_content(
             [ticket_generation_user_prompt],
@@ -392,17 +504,8 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
         if ticket_details["issue_type"] not in ["Epic", "Story"]:
             raise ValueError(f"Invalid issue_type generated: '{ticket_details['issue_type']}'.")
 
-        # --- CORRECTED: Atlassian Document Format for description ---
-        adf_description = {
-            "type": "doc", "version": 1, "content": [
-                {"type": "paragraph", "content": [
-                    {"type": "text", "text": ticket_details.get("description", "")}
-                ]}
-            ]
-        }
-
-        url = f"{settings.jira_base_url}/rest/api/3/issue"
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        adf_description = {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": ticket_details.get("description", "")}]}]}
         payload = {"fields": {
             "project": {"key": settings.project_key},
             "summary": ticket_details["summary"],
@@ -413,27 +516,41 @@ def generate_client_ticket(request: GenerateClientTicketRequest):
         if ticket_details["issue_type"] == "Story" and parent_epic_key != "N/A":
             payload["fields"][settings.epic_link_field_id] = parent_epic_key
 
+        assignee_account_id = None
         if request.assignee_email:
-            account_id = get_account_id_by_email(request.assignee_email)
-            if account_id:
-                payload["fields"]["assignee"] = {"accountId": account_id}
-            else:
-                logging.warning(f"Could not find Jira user for assignee email: {request.assignee_email}.")
+            assignee_account_id = get_account_id_by_email(request.assignee_email)
+            if assignee_account_id:
+                payload["fields"]["assignee"] = {"accountId": assignee_account_id}
 
-        jira_response = requests.post(url, headers=headers, auth=auth, json=payload)
+        jira_response = requests.post(f"{settings.jira_base_url}/rest/api/3/issue",
+                                      headers={"Accept": "application/json", "Content-Type": "application/json"},
+                                      auth=auth, json=payload)
         jira_response.raise_for_status()
+        jira_issue_data = jira_response.json()
 
-        return {"message": "Jira ticket created successfully", "key": jira_response.json()["key"],
+        db_ticket = GeneratedTicketDB(
+            request_id=db_request.request_id,
+            classification_log_id=db_classification.log_id,
+            jira_issue_key=jira_issue_data["key"],
+            jira_issue_id=jira_issue_data["id"],
+            summary=ticket_details["summary"],
+            issue_type=ticket_details["issue_type"],
+            parent_issue_key=ticket_details.get("parent"),
+            assignee_account_id=assignee_account_id,
+            generated_by_model="gemini-2.5-pro",
+            raw_generated_json=ticket_details
+        )
+        db.add(db_ticket)
+        db.commit()
+
+        return {"message": "Jira ticket created successfully", "key": jira_issue_data["key"],
                 "generated_details": ticket_details}
-    except requests.exceptions.HTTPError as e:
-        raise HTTPException(status_code=e.response.status_code,
-                            detail=f"Failed to create Jira issue: {e.response.text}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.post("/clear_collection")
-def clear_collection():
+def clear_collection(db: Session = Depends(get_db)):
     try:
         num_items = collection.count()
         if num_items == 0:
