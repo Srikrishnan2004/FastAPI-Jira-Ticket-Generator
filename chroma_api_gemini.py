@@ -248,7 +248,7 @@ def generate_ticket(request: GenerateTicketRequest, db: Session = Depends(get_db
         results = collection.query(
             query_texts=[request.commit_message], n_results=1,
             where={"$and": [{"repo": request.repo}, {"issue_type": child_issue_type}, {"parent": parent_key}]},
-            include=["metadatas", "documents", "ids"]
+            include=["metadatas", "documents", "distances"]
         )
         if results and results.get("ids") and results["ids"][0]:
             child_metadata = dict(results["metadatas"][0][0]);
@@ -260,7 +260,7 @@ def generate_ticket(request: GenerateTicketRequest, db: Session = Depends(get_db
         results = collection.query(
             query_texts=[request.commit_message], n_results=1,
             where={"$and": [{"repo": request.repo}, {"issue_type": issue_type}]},
-            include=["metadatas", "documents", "ids"]
+            include=["metadatas", "documents", "distances"]
         )
         if results and results.get("ids") and results["ids"][0]:
             matched_metadata = dict(results["metadatas"][0][0]);
@@ -452,7 +452,7 @@ def generate_client_ticket(request: GenerateClientTicketRequest, db: Session = D
     epic_search_results = collection.query(
         query_texts=[request.request_text], n_results=1,
         where={"$and": [{"repo": request.repo}, {"issue_type": "Epic"}]},
-        include=["metadatas", "ids"]
+        include=["metadatas", "distances"]
     )
     related_epic_view, parent_epic_key = "No related Epic found.", "N/A"
     if epic_search_results and epic_search_results.get("ids") and epic_search_results["ids"][0]:
