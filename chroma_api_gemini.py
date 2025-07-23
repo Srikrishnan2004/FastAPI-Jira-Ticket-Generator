@@ -109,6 +109,24 @@ def add_document(request: AddDocumentRequest):
     return {"status": "Document added successfully"}
 
 
+@app.get("/getall")
+def get_all_documents():
+    """
+    Retrieves all documents, metadata, and IDs from the ChromaDB collection.
+    """
+    try:
+        count = collection.count()
+        if count == 0:
+            return {"message": "The collection is empty."}
+
+        # Retrieve all items by using the total count as the limit
+        all_items = collection.get(limit=count)
+        return all_items
+    except Exception as e:
+        logging.error(f"Failed to retrieve all documents from ChromaDB: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while fetching from ChromaDB: {e}")
+
+
 @app.post("/generate_ticket")
 def generate_ticket(request: GenerateTicketRequest):
     logging.info("Attempting to generate ticket for: %s", request.commit_message)
